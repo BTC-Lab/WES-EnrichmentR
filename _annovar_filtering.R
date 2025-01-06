@@ -49,6 +49,8 @@ library(igraph)
 library(readr)
 library(pathview)
 library(ExperimentHub)
+library(ggpubr)
+library(plotly)
 
 
 # FUNCTIONS ---------------------------------------------------------------
@@ -72,11 +74,11 @@ prepATable <- function( input.df, f.freq=0.01, assoc.col=NULL ) {
     mutate(., Location = paste(Chr, Start, sep=":")) %>%
     separate_rows(Gene.refGene, sep = ";") %>%
     #mutate(., varID = paste(Chr, Start, End, Ref, Alt, sep="_")) %>%
-    mutate_at(vars(starts_with("gnomad312")), ~ replace_na(., 0)) %>%
-    #dplyr::filter(., gnomad312_AF < f.freq) #%>%
-    dplyr::filter(., gnomad312_AF_afr < f.freq & gnomad312_AF_ami < f.freq & gnomad312_AF_amr < f.freq &
-                    gnomad312_AF_asj < f.freq & gnomad312_AF_eas < f.freq & gnomad312_AF_fin < f.freq &
-                    gnomad312_AF_mid < f.freq& gnomad312_AF_nfe < f.freq& gnomad312_AF_sas < f.freq)
+    mutate_at(vars(starts_with("gnomad41")), ~ replace_na(., -1)) %>%
+    #dplyr::filter(., gnomad41_genome_AF < f.freq) #%>%
+    dplyr::filter(., gnomad41_genome_AF_afr < f.freq & gnomad41_genome_AF_ami < f.freq & gnomad41_genome_AF_amr < f.freq &
+                    gnomad41_genome_AF_asj < f.freq & gnomad41_genome_AF_eas < f.freq & gnomad41_genome_AF_fin < f.freq &
+                    gnomad41_genome_AF_mid < f.freq& gnomad41_genome_AF_nfe < f.freq& gnomad41_genome_AF_sas < f.freq)
   
   
   ## extract all pathogenic variants
@@ -135,14 +137,14 @@ prepATable <- function( input.df, f.freq=0.01, assoc.col=NULL ) {
   ## associated through curated list of genes, by cancer in description, and through function
   df.associated <- df.unscored %>%
     dplyr::filter(., (Gene.refGene %in% assoc.col) | 
-                    (grepl("cancer", Function_description.refGene, ignore.case = TRUE)) | 
+                    (grepl("cancer", CLNDN, ignore.case = TRUE)) | 
                     (ExonicFunc.refGene %in% c("stopgain","startloss",
                                                "nonsynonymous SNV","frameshift insertion",
                                                "frameshift deletion")) )
   
   df.unscored <- df.unscored %>%
     dplyr::filter(., !((Gene.refGene %in% assoc.col) | 
-                         (grepl("cancer", Function_description.refGene, ignore.case = TRUE)) | 
+                         (grepl("cancer", CLNDN, ignore.case = TRUE)) | 
                          (ExonicFunc.refGene %in% c("stopgain","startloss",
                                                     "nonsynonymous SNV","frameshift insertion",
                                                     "frameshift deletion"))) )
@@ -262,7 +264,18 @@ mergeGage <- function( df.merge, df.input, s.idx, c.idx ) {
   return(df.merge)
 }
 
-plotPathwayBar <- function( p.df, xlabel="Number of UP-regulated pathways", ylabel="REACTOME pathways", w.label=35) {
+plotPathwayBar <- function( p.df, xlabel="Number of Enriched Pathways", ylabel="REACTOME pathways", w.label=35) {
+  
+  ## get top 20
+  if( length(p.df$pathway) >= 20) {
+    p.df <- p.df %>%
+      filter(pathway %in% names(sort(table(p.df$pathway), decreasing = TRUE))[1:20])
+  } else {
+    p.df <- p.df %>%
+      filter(pathway %in% names(sort(table(p.df$pathway), decreasing = TRUE))[1:length(p.df$pathway)])
+  }
+
+  names(sort(table(p.df$pathway), decreasing = TRUE))[1:20]
   
   ggplot(p.df, aes(y = forcats::fct_inorder(pathway, ordered=TRUE), 
                    fill = cohort)) +
@@ -276,6 +289,391 @@ plotPathwayBar <- function( p.df, xlabel="Number of UP-regulated pathways", ylab
   
 }
 
+
+### This will clean the enrichment pathway output and remove pathways with 
+### overlaps smaller than 'cutoff'.
+cleanPW <- function(input.df, cutoff = 1, filter.by = "total" ) {
+  
+  f.col <- ifelse(filter.by == " total", "n.total", "n.cohort")
+  
+  
+  df.out <- input.df %>%
+    dplyr::mutate(Cancer.TypeClean = str_to_title(cohort)) %>% 
+    dplyr::mutate(Cancer.TypeRedux = factor(
+      ifelse(is.na(Cancer.TypeClean), "Healthy", ifelse(Cancer.TypeClean  %in% c("Breast", "Colon","Leukemia"), Cancer.TypeClean, "Other")), 
+      levels = c("Breast","Leukemia","Colon","Other", "Healthy"))) %>%
+    dplyr::filter(Cancer.TypeRedux != "Other") %>%
+    group_by(pathway) %>%
+    mutate(n.total = n()) %>%
+    ungroup() %>%
+    group_by(pathway, cohort) %>%
+    mutate(n.cohort = n()) %>%
+    ungroup() %>%
+    dplyr::arrange(desc(n.cohort)) %>%
+    filter(eval(f.col) >= eval(cutoff))
+  
+  return(df.out)
+}
+
+## Create a 'hom.het' column indicating alternate variant state
+cleanHomHet <- function(varTable.df, gt.col = "GT", var.col = "Variant", by.vaf = FALSE, by.dp = NULL) {
+  
+  varTable.df <- varTable.df %>%
+    mutate( GT = sub(":.*", "", get(var.col)),
+            VAF = sub(".*:", "", get(var.col)), .before = cytoBand) %>%
+    dplyr::filter(VAF != ".") %>%
+    mutate(VAF = as.numeric(as.character(VAF))) %>%
+    dplyr::mutate(phased = ifelse(grepl("|", GT, fixed = TRUE), TRUE, FALSE),
+      hom.het = sapply(GT, function(x) ifelse(x == "1/1", "hom",
+                                                  ifelse(x == "1|1", "hom", 
+                                                         ifelse(x == "0/0", "hom", 
+                                                                ifelse(x == "0|0", "hom", "het"))))), .after = GT) %>%
+    mutate(AD = sub("^[^:]*:([^:]*):.*$", "\\1", get(var.col)),
+           AD1 = as.numeric(as.character(sub(",.*", "", AD))),
+           AD2 = as.numeric(as.character(sub(".*,", "", AD))))
+  
+  if( by.vaf ) {
+    varTable.df <- varTable.df %>%
+      dplyr::filter(
+        (hom.het == "het" & VAF >= 0.3 & VAF <= 0.7) |  
+          (hom.het == "hom" & phased & VAF >= 0.3) |
+          (hom.het == "hom" & !phased & VAF >= 0.85)
+      )
+  }
+  
+  if( !is.null(by.dp) ) {
+    varTable.df <- varTable.df %>%
+      dplyr::filter(
+        (AD1 + AD2 >= eval(by.dp)))  
+  }
+  
+  return(varTable.df)
+}
+
+## subset either to top n of the cohort or to top n total
+subsetPWCohort <- function(input.df, n.top = 10, by.cohort = 1, by.pw = NULL) {
+  
+  if( !any(grepl("n.total", colnames(input.df))) ) {
+    
+    input.df <- cleanPW(input.df, cutoff = 1, filter.by = "total")
+  }
+  
+  if( !is.null(by.pw) ) {
+    top.out <- input.df %>%
+      dplyr::filter(pathway %in% by.pw)
+  }
+  else if( by.cohort == 1 ) {
+    input.df <- input.df %>%
+      dplyr::mutate(pw.cohort = paste0(cohort, "_", pathway))
+    subset.vec <- NULL
+    ## get top n for each cohort
+    for( c.idx in unique(input.df$cohort) ) {
+      
+      tmp.p.df <- input.df %>%
+        dplyr::filter(!duplicated(pw.cohort)) %>%
+        dplyr::filter(cohort == eval(c.idx)) %>%
+        dplyr::arrange(desc(n.cohort)) %>%
+        dplyr::slice_head(n = n.top)
+      
+      subset.vec <- c(subset.vec, tmp.p.df$pw.cohort)
+    }
+    
+    top.out <- input.df %>%
+      dplyr::filter(pw.cohort %in% subset.vec)
+    
+    
+  } else {
+    ## return top n overall
+    tmp.p.df <- input.df %>%
+      dplyr::filter(!duplicated(pathway)) %>%
+      dplyr::arrange(desc(n.total)) %>%
+      dplyr::slice_head(n = n.top)
+    
+    subset.vec <- c(subset.vec, tmp.p.df$pathway)
+    
+    top.out <- input.df %>%
+      dplyr::filter(pathway %in% subset.vec)
+    
+  }
+  
+  top.out <- top.out  %>%
+    arrange(cohort, n.cohort) %>%
+    dplyr::mutate(pathway = factor(pathway, levels = c(unique(pathway))))
+  
+  return(top.out)
+  
+}
+
+
+## for heatmap get the overlapping Genes
+getGeneOverlap <- function(input.df, n.top = 10, by.gene = NULL, clean.variants = FALSE) {
+  
+  ## if we want to clean up the variants, we do before subsetting
+  if( clean.variants ) {
+    
+    input.df <- input.df %>%
+      dplyr::filter(!is.na(ExonicFunc.refGene)) %>%
+      dplyr::filter(ExonicFunc.refGene != "unknown") %>%
+      dplyr::filter(ExonicFunc.refGene != "synonymous SNV")
+    
+  }
+  
+  if( !is.null(by.gene) ) {
+    
+    input.df <- dplyr::filter(input.df, Gene.refGene %in% by.gene)
+    
+  } else {
+    
+    c.names <- colnames(input.df)
+    
+    input.df <- input.df %>%
+      group_by(Gene.refGene) %>%
+      tally(name = "count") %>%
+      arrange(desc(count)) %>%
+      slice_head(n = n.top) %>%
+      inner_join(input.df, by = "Gene.refGene") %>%
+      dplyr::select(all_of(c.names))
+  }
+  
+  
+  return(input.df)
+  
+}
+
+## plot VAF for all variants in given table
+plotVAF <- function(varTable.df, ad.filter = 10) {
+  
+  ## just sanity check
+  if( !any(grepl("hom.het", colnames(varTable.df))) ) {
+    varTable.df <- cleanHomHet(varTable.df)
+  }
+  
+  varTable.df <- varTable.df %>%
+    dplyr::filter(
+      (hom.het == "het" & AD1 >= eval(ad.filter) & AD2 >= eval(ad.filter)) |  
+        (hom.het == "hom" & AD1 + AD2 >= eval(ad.filter) * 2))
+  
+  ggplot(varTable.df, aes(x = hom.het, y = VAF, fill = phased, color = hom.het)) +
+    geom_point(position = position_jitter(width = 0.3), size = 5, alpha = 0.75, shape = 21) +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1), limits = c(0, 1.01)) +
+    labs(
+      title = "Variant Allele Fraction (VAF) by Genotype Class",
+      x = "Genotype Class",
+      y = "Variant Allele Fraction (VAF)",
+      fill = "Phased" 
+    ) +
+    facet_grid(. ~ cohort, scales = "free", space = "free", 
+               labeller = labeller(cohort = c(
+                 "breast" = "Breast",
+                 "colon" = "Colon",
+                 "leukemia" = "Leukemia",
+                 "other" = "Other"
+               ))) +
+    theme_minimal() +
+    theme(
+      panel.background = element_blank(),
+      plot.background = element_blank(),
+      axis.title.x = element_blank(),
+      axis.title.y = element_text(size = 20),
+      strip.background = element_rect(fill = "lightgrey", color = "black"), 
+      legend.position = "bottom", 
+      axis.text.x = element_text(size = 14),
+      axis.text.y = element_text(size = 14),
+      axis.ticks.y = element_blank(),
+      strip.text.x = element_text(size = 16),
+      panel.border = element_blank()
+    ) +
+    scale_fill_manual(values = c("TRUE" = "lightblue", "FALSE" = "white")) +
+    scale_color_manual(values = c("het" = "red", "hom" = "blue")) +
+    scale_x_discrete(labels = c("hom" = "Hom", "het" = "Het")) + guides(color="none") 
+  
+}
+
+
+## INIT plt.colors for consistent legend accross plots
+## ToDo: find a better way --> in a package this would be a object element.
+cols <- pals::tableau20(20)
+p.cols <- c(cols[1],cols[3],cols[5],cols[7],cols[9],cols[11],cols[13],cols[15],cols[17],cols[19],cols[6],cols[6],cols[6])
+
+all.labels <- c("frameshift_insertion","frameshift_deletion","nonsynonymous_SNV",
+                "nonframeshift_deletion","stopgain","frameshift_deletion,nonsynonymous_SNV",
+                "frameshift_deletion,stopgain","frameshift_deletion,frameshift_insertion",
+                "startloss","nonframeshift_insertion","frameshift_insertion,nonsynonymous_SNV",
+                "frameshift_deletion,frameshift_insertion,stopgain","stoploss",
+                "nonframeshift_deletion,nonframeshift_insertion")
+
+sorted_labels <- sapply(all.labels, function(x) {
+  sorted_elements <- sort(unlist(strsplit(x, ","))) # Split by comma, sort, and recombine
+  paste(sorted_elements, collapse = ",")
+})
+names(sorted_labels) <- NULL
+sorted_labels <- unique(sorted_labels)
+plt.colors = structure(cols, names = sorted_labels)
+
+
+
+library(ComplexHeatmap)
+
+plotGeneOverlapHeatmap <- function(input.df, meta, p.colors = NULL, order.by.name = FALSE, w.label = 35) {
+  
+  
+  ### ToDo: make tiles transparent based on revel score or VAF maybe?!
+  meta.labels <- meta %>%
+    dplyr::select(sampleID, fID)
+  
+  plot.df <- input.df %>%
+    dplyr::mutate(ExonicFunc.refGene = gsub(" ", "_", ExonicFunc.refGene)) %>%
+    group_by(sampleID, Gene.refGene, ExonicFunc.refGene, cohort) %>% 
+    tally(name = "count") %>%  # Count occurrences
+    pivot_wider( names_from = ExonicFunc.refGene, values_from = count, values_fill = 0) %>%
+    pivot_longer(cols = -c(sampleID, Gene.refGene, cohort),names_to = "VariantType",values_to = "Count") %>%
+    dplyr::filter(Count > 0) %>%
+    mutate(grouping = paste0(Gene.refGene, "_", sampleID)) %>%
+    group_by(grouping, Gene.refGene, sampleID, cohort) %>% # 
+    summarise(VariantType = paste(unique(VariantType), collapse = ","),Count = paste(Count, collapse = ","),.groups = "drop") %>%
+    group_by(sampleID, Gene.refGene, cohort) %>%
+    summarise(VariantType = paste(unique(VariantType), collapse = ";"),.groups = "drop") %>%
+    pivot_wider(names_from = Gene.refGene,values_from = VariantType,values_fill = NA)
+  
+  
+  # Apply the transformation to all but the first two columns
+  plot.df <- plot.df %>%
+    mutate(across(
+      .cols = -c(sampleID, cohort),  # Exclude the first two columns
+      .fns = ~ sapply(., function(x) {
+        if (is.na(x)) return(NA_character_)  # Handle NA values
+        sorted_elements <- sort(unlist(strsplit(as.character(x), ",")))  # Split, sort, and recombine
+        paste(sorted_elements, collapse = ",")
+      }),
+      .names = "{.col}"  # Add "sorted_" prefix to transformed columns
+    ))
+  
+  # View the transformed dataframe
+  
+  c.order <- colnames(plot.df)
+  
+  plot.df <- plot.df %>%
+    dplyr::left_join(., meta.labels, by = "sampleID") %>%
+    dplyr::select(c.order[1:2], fID, c.order[-c(1,2)]) %>%
+    arrange(cohort, fID)
+  
+  labels <- plot.df %>%
+    dplyr::select(-c(sampleID, cohort, fID)) %>%
+    pivot_longer(cols = everything(), values_to = "value") %>% # Reshape to a long format
+    distinct(value) %>%
+    dplyr::filter(!is.na(value)) %>%
+    pull(value)
+  
+  if( is.null(p.colors) ) {
+    cols <- pals::tableau20()
+    p.colors = structure(cols, names = labels)
+  } else {
+    print("Debug: else")
+    p.colors <- p.colors[which(names(p.colors) %in% labels)]
+  }
+  # fix labels
+  heat_legend_labels <- data.frame("value" = labels) %>%
+    dplyr::mutate(value = gsub("_", " ", value)) %>%
+    dplyr::mutate(value = gsub(",", ", ", value)) %>%
+    dplyr::mutate(value = stringr::str_to_title(value)) %>%
+    dplyr::mutate(value = gsub("Snv", "SNV", value)) %>%
+    pull(value)
+  
+  
+  heat_legend_labels <- sapply(heat_legend_labels, 
+                               function(x) str_wrap(str_replace_all(x, "_", " "),width = w.label))
+  
+  n.rows <- ifelse(length(heat_legend_labels) > 9, 3, 2)
+  
+  mat <- t(as.matrix(plot.df))
+  
+  colnames(mat) <- mat[3,]
+  
+  ## facet labels
+  f.labels <- sapply( unique(mat[2,]), function(x) {
+    paste0(toupper(substring(x, 1, 1)), tolower(substring(x, 2)))
+  })
+  
+
+    if( order.by.name ) {
+      ## sort genes alphabetically
+      row_order <- order(rownames(mat[-c(1,2,3), ]))
+      sorted_mat <- mat[-c(1,2,3), ][row_order, ] 
+    } else {
+      row_order <- apply(mat[-c(1,2,3), ], 1, function(row) sum(is.na(row)))
+      # Order rows based on the NA counts
+      sorted_mat <- mat[-c(1,2,3), ][order(row_order), ]
+    }
+
+  
+
+  ## sort sample IDs
+  col_order <- order(as.numeric(gsub("S", "", colnames(sorted_mat))))
+  sorted_mat <- sorted_mat[, col_order]
+  
+  # Generate the heatmap with sorted rows
+  h.map <- ComplexHeatmap::Heatmap(
+    sorted_mat, na_col = "lightgrey", column_split = mat[2,], 
+    column_title = NULL, row_km = TRUE, col = p.colors,
+    row_title = NULL, column_names_rot = 90,
+    top_annotation = HeatmapAnnotation(
+      foo = anno_block(
+        gp = gpar(fill = "lightgrey"),
+        labels = eval(f.labels), 
+        labels_gp = gpar(col = "black", fontsize = 12)
+      )
+    ),
+    name = "Variant types", 
+    rect_gp = gpar(col = "white", lwd = 2), 
+    cluster_rows = FALSE,
+    cluster_columns = FALSE,
+    heatmap_legend_param = list(labels = heat_legend_labels, at = labels, direction = "horizontal", nrow = eval(n.rows))
+  )
+  
+  ## draw(h.map, heatmap_legend_side = "bottom")
+
+  
+  return(h.map)
+}
+
+
+plotPathwayBarCohort <- function( p.df, xlabel="Number of Enriched Pathways", ylabel="REACTOME pathways", w.label=35) {
+  
+#  names(sort(table(p.df$pathway), decreasing = TRUE))[1:20]
+  
+  ggplot(p.df, aes(y = forcats::fct_inorder(pathway, ordered = TRUE), 
+                   fill = Cancer.TypeClean)) +
+    geom_bar(width = .85, color = "black") +
+    scale_fill_manual(values = plt.cols) +
+    theme(axis.text.x = element_text(angle = 0, vjust = 0.5, hjust = 1)) +
+    scale_y_discrete(labels = function(x) str_wrap(str_replace_all(x, "_", " "),
+                                                   width = w.label)) +
+#    facet_grid(cols = vars(cohort), scales = "free_x", labeller = label_parsed) +
+    facet_grid(. ~ cohort, scales = "free", space = "free", 
+               labeller = labeller(cohort = c(
+                 "breast" = "Breast (n=18)",
+                 "leukemia" = "Leukemia (n=18)",
+                 "colon" = "Colon (n=11)"
+               ))) +
+    xlab(eval(xlabel)) + ylab(eval(ylabel)) + 
+    this_theme() +
+    theme(
+      legend.position = "none", 
+      axis.text.y = element_text(size = 12),
+      axis.ticks.y = element_blank(),
+      axis.title.x = element_text(size = 16),
+      axis.title.y = element_blank(),
+      strip.text.x = element_text(size = 16),
+      panel.border = element_blank()
+    ) +
+    scale_x_continuous(breaks = function(x) seq(floor(min(x)), ceiling(max(x)), by = 2))
+  
+}
+
+
+
+
+## helper function - for a single sample remove background of choice
 removeCtrlBackground <- function( input.list, ctrl.df ) {
   
   for( type.idx in names(input.list) ) {
@@ -291,9 +689,47 @@ removeCtrlBackground <- function( input.list, ctrl.df ) {
 }
 
 
+## just remove the healthy ctrl background
+removeCtrlBackgroundList <- function(case.list, ctrl.list) {
+  
+  tmp.ctrl <- rbind.data.frame(ctrl.list$pathogenic, ctrl.list$potential, ctrl.list$associated, ctrl.list$benign,ctrl.list$likely_benign, ctrl.list$unscored)
+  tmp.case <- case.list
+  
+  for( s.idx in names(case.list) ) {
+    tmp.case[[s.idx]] <- removeCtrlBackground( case.list[[s.idx]], tmp.ctrl )
+  }
+  
+  return(tmp.case)
+}
 
-
-
+## Use specifically matched background for every sample and run through whole cohort
+removeCtrlBackgroundMatched <- function(case.list, ctrl.list, df.meta, match.col) {
+  
+  ## just dirty duplicate for output
+  tmp.case <- case.list
+  ctrl.list <- rbind.data.frame(ctrl.list$pathogenic, ctrl.list$potential, 
+                                ctrl.list$associated, ctrl.list$benign,
+                                ctrl.list$likely_benign, ctrl.list$unscored)
+  ## find the matched samples
+  for( s.idx in names(case.list) ) {
+    ## 1. find matched ctrl
+    match.idx <- df.meta$S.merge[which(df.meta$Sample == eval(s.idx))]
+    match.ids <- df.meta %>% 
+      dplyr::filter(get(match.col) == eval(match.idx) & Sample != eval(s.idx)) %>%
+      dplyr::select(Sample)
+    ## and subset the background so that all the called variants need to have ALT
+    tmp.ctrl <- ctrl.list %>%
+      rowwise() %>%
+      filter(all(grepl("(^[^:]*1)|(^\\./\\.)", c_across(match.ids$Sample)))) %>%
+      ungroup()
+    
+    tmp.case[[s.idx]] <- removeCtrlBackground( case.list[[s.idx]], tmp.ctrl )
+    ## le progress
+    print(paste0("Finished: ",s.idx))
+  }
+  
+  return(tmp.case)
+}
 
 
 

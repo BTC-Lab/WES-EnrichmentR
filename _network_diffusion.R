@@ -18,6 +18,9 @@ FILESOURCE <- file.path(WORKDIR, "data")
 
 # LOAD LIBRARIES ----------------------------------------------------------
 
+# BiocManager::install("DESeq2")
+
+
 require(diffuStats)
 require(STRINGdb)
 require(igraph)
